@@ -2,7 +2,7 @@
 # Firewall Manager — with rule-search upgrades: export, hotkeys, presets, mass reinstall, autosync DB
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-import os, sys, subprocess, shutil, json
+import os, sys, subprocess, shutil, json, threading
 from datetime import datetime
 
 from firewall_manager.utils import is_admin, run_as_admin
@@ -12,6 +12,14 @@ from firewall_manager.core import (
     rebuild_db_from_firewall, list_running_processes, delete_rule_by_path
 )
 from firewall_manager.ui_helpers import install_shortcuts, append_log, clear_log as ui_clear_log
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
 
 # ---- working dir ----
 SCRIPT_PATH = os.path.abspath(sys.argv[0])
@@ -594,6 +602,109 @@ tk.Button(bottom_frame, text="🧽 Очистити лог", command=clear_log, 
 tk.Button(bottom_frame, text="🧾 Зберегти лог…", command=save_log_to_file, width=16, bg="#8bc34a", fg="black").pack(side='right', padx=5)
 
 status_var = tk.StringVar(value="Готово."); status_bar = tk.Label(root, textvariable=status_var, relief='sunken', anchor='w', bg="#333", fg="#ccc"); status_bar.pack(side='bottom', fill='x')
+
+_tray_icon = None
+_tray_thread = None
+_tray_active = False
+_tray_available = pystray is not None and Image is not None and ImageDraw is not None
+
+
+def _create_tray_image():
+    if not _tray_available:
+        return None
+    img = Image.new("RGBA", (64, 64), (30, 30, 30, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((8, 8, 56, 56), radius=10, fill=(0, 122, 204, 255))
+    draw.rectangle((20, 24, 44, 40), fill=(255, 255, 255, 255))
+    draw.rectangle((24, 20, 40, 44), fill=(255, 255, 255, 255))
+    return img
+
+
+def _stop_tray_icon():
+    global _tray_icon, _tray_active, _tray_thread
+    if _tray_icon is not None:
+        try:
+            _tray_icon.stop()
+        except Exception:
+            pass
+    _tray_icon = None
+    _tray_active = False
+    _tray_thread = None
+
+
+def _show_from_tray(icon=None, item=None):
+    def _show():
+        root.deiconify()
+        try:
+            root.after(100, root.lift)
+        except Exception:
+            pass
+        status_var.set("Вікно відновлено")
+
+    root.after(0, _show)
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+    _stop_tray_icon()
+
+
+def _quit_from_tray(icon=None, item=None):
+    def _quit():
+        _stop_tray_icon()
+        root.destroy()
+
+    root.after(0, _quit)
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+
+def _hide_to_tray(event=None, *, from_event=False):
+    global _tray_thread, _tray_icon, _tray_active
+    if not _tray_available:
+        if from_event:
+            return
+        else:
+            root.destroy()
+        return
+    if _tray_active:
+        return
+    _tray_active = True
+    root.withdraw()
+    status_var.set("Згорнуто в трей")
+
+    def _run_icon():
+        global _tray_icon
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem("Відкрити Firewall Manager", _show_from_tray),
+                pystray.MenuItem("Вихід", _quit_from_tray),
+            )
+            _tray_icon = pystray.Icon(
+                "firewall_manager",
+                _create_tray_image(),
+                "Firewall Manager",
+                menu,
+            )
+            _tray_icon.run()
+        finally:
+            _stop_tray_icon()
+
+    _tray_thread = threading.Thread(target=_run_icon, daemon=True)
+    _tray_thread.start()
+
+
+def _handle_unmap(event):
+    if event.widget is root and root.state() == "iconic":
+        root.after(100, lambda: _hide_to_tray(from_event=True))
+
+
+root.protocol("WM_DELETE_WINDOW", _hide_to_tray)
+root.bind("<Unmap>", _handle_unmap)
 
 reload_blocked_list()
 root.mainloop()
