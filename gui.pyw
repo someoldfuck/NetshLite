@@ -7,11 +7,15 @@ from datetime import datetime
 
 from firewall_manager.utils import is_admin, run_as_admin
 from firewall_manager.db import load_db, save_db, clear_db, backup_db, import_db
+from firewall_manager.allowdb import load_allow_db
 from firewall_manager.core import (
     block_program, unblock_program, update_rule,
-    rebuild_db_from_firewall, list_running_processes, delete_rule_by_path
+    rebuild_db_from_firewall, list_running_processes, delete_rule_by_path,
+    allow_program
 )
 from firewall_manager.ui_helpers import install_shortcuts, append_log, clear_log as ui_clear_log
+from firewall_manager.monitor import OutboundConnectionMonitor
+from firewall_manager.tray import TrayController
 
 # ---- working dir ----
 SCRIPT_PATH = os.path.abspath(sys.argv[0])
@@ -33,6 +37,11 @@ if not is_admin():
 
 # ---- DB ----
 db = load_db()
+allow_db = load_allow_db()
+
+# ---- background controllers ----
+connection_monitor = None
+tray_controller = None
 
 # ---- helpers: netsh & encoding-safe runner ----
 def _netsh_path():
@@ -191,6 +200,8 @@ def block_action():
     if not fp or not os.path.isfile(fp):
         messagebox.showerror("Помилка", "Некоректний шлях або файл не існує."); return
     r1, r2 = block_program(db, fp, note)
+    if connection_monitor:
+        connection_monitor.mark_known(fp)
     append_log(log_text, f"✅ Заблоковано {fp}\nВхід: {r1.returncode}\nВихід: {r2.returncode}")
     status_var.set("Програма заблокована ✅"); reload_blocked_list()
 
@@ -202,6 +213,8 @@ def unblock_action():
         try:
             r1, r2 = unblock_program(db, p)
             append_log(log_text, f"🗑 Розблоковано {p}\nВхід: {r1.returncode}\nВихід: {r2.returncode}")
+            if connection_monitor:
+                connection_monitor.forget(p)
         except Exception as e:
             append_log(log_text, f"❗ Помилка розблокування {p}: {e}")
     status_var.set(f"Розблоковано {len(paths)} програм"); reload_blocked_list()
@@ -236,6 +249,11 @@ def clear_database():
 
 def restore_from_firewall_action():
     added, total = rebuild_db_from_firewall(db); reload_blocked_list()
+    if connection_monitor:
+        for rec in db.values():
+            path = rec.get("path")
+            if path:
+                connection_monitor.mark_known(path)
     if total == 0:
         append_log(log_text,"ℹ️ У фаєрволі не знайдено правил Block_*"); status_var.set("Нічого не знайдено")
     else:
@@ -280,8 +298,96 @@ def clean_broken_records():
             except Exception:
                 pass
         del db[k]; removed_db+=1
+        if connection_monitor:
+            connection_monitor.forget(path)
     save_db(db); reload_blocked_list()
     append_log(log_text, f"🧹 Видалено з БД:{removed_db} правил:{removed_fw}")
+
+# ---- outbound monitor ----
+def _format_remote_info(event: dict) -> str:
+    remote = event.get("remote_address") or "невідомо"
+    port = event.get("remote_port")
+    if port:
+        return f"{remote}:{port}"
+    return str(remote)
+
+
+def _ask_user_about_connection(path: str, remote_info: str) -> str:
+    win = tk.Toplevel(root)
+    win.title("Новий вихідний зв'язок")
+    win.configure(bg="#1e1e1e")
+    win.resizable(False, False)
+    message = (
+        "Виявлено спробу вихідного підключення від програми:\n\n"
+        f"{path}\n\n"
+        f"Ціль: {remote_info}\n\n"
+        "Що робити?"
+    )
+    tk.Label(win, text=message, bg="#1e1e1e", fg="#f0f0f0", justify="left", wraplength=520).pack(padx=16, pady=(16, 12))
+
+    result = {"value": "ignore"}
+
+    btns = tk.Frame(win, bg="#1e1e1e")
+    btns.pack(fill="x", padx=16, pady=(0, 16))
+
+    def _set(value: str):
+        result["value"] = value
+        win.destroy()
+
+    tk.Button(btns, text="Дозволити", command=lambda: _set("allow"), width=12, bg="#4caf50", fg="white").pack(side="left", padx=4)
+    tk.Button(btns, text="Заблокувати", command=lambda: _set("block"), width=14, bg="#e53935", fg="white").pack(side="left", padx=4)
+    tk.Button(btns, text="Ігнорувати", command=lambda: _set("ignore"), width=12, bg="#607d8b", fg="white").pack(side="right", padx=4)
+
+    win.transient(root)
+    win.grab_set()
+    root.wait_window(win)
+    return result["value"]
+
+
+def handle_outgoing_event(event: dict, monitor_obj):
+    path = event.get("path")
+    if not path:
+        return
+    if not os.path.isfile(path):
+        monitor_obj.mark_known(path)
+        return
+
+    remote_info = _format_remote_info(event)
+
+    decision = _ask_user_about_connection(path, remote_info)
+    note = f"auto {remote_info}"
+
+    if decision == "allow":
+        try:
+            res = allow_program(allow_db, path, note=note)
+            append_log(log_text, f"✅ Дозволено {path} -> {res.returncode if hasattr(res,'returncode') else res}")
+            status_var.set("Створено дозвіл на вихід")
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося створити правило дозволу:\n{e}")
+        finally:
+            monitor_obj.mark_known(path)
+        return
+
+    if decision == "block":
+        try:
+            r1, r2 = block_program(db, path, note=note)
+            append_log(log_text, f"⛔ Заблоковано {path} ({r1.returncode},{r2.returncode})")
+            reload_blocked_list()
+            status_var.set("Програму заблоковано через монітор")
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося заблокувати програму:\n{e}")
+        finally:
+            monitor_obj.mark_known(path)
+        return
+
+    monitor_obj.ignore_once(path)
+    append_log(log_text, f"ℹ️ Ігноровано підключення {path} ({remote_info})")
+    status_var.set("Спробу підключення проігноровано")
+
+
+def report_monitor_error(msg: str):
+    append_log(log_text, f"⚠️ Моніторинг: {msg}")
+    status_var.set("Помилка моніторингу")
 
 # ---- process picker ----
 def open_process_picker():
@@ -330,6 +436,8 @@ def open_process_picker():
             try:
                 if not os.path.isfile(p): append_log(log_text, f"⚠️ Пропущено (нема файлу): {p}"); continue
                 r1,r2 = block_program(db,p,note); append_log(log_text, f"✅ Заблоковано {p} ({r1.returncode},{r2.returncode})"); ok+=1
+                if connection_monitor:
+                    connection_monitor.mark_known(p)
             except Exception as e:
                 append_log(log_text, f"❗ Помилка: {e}")
         if ok: reload_blocked_list(); status_var.set(f"Заблоковано {ok}")
@@ -527,7 +635,13 @@ def reveal_in_explorer():
 root = tk.Tk(); root.title("🔒 Firewall Manager"); root.geometry("1000x800"); root.configure(bg="#1e1e1e"); root.resizable(True,True)
 
 # menu
-menubar = tk.Menu(root); settings_menu = tk.Menu(menubar, tearoff=0)
+menubar = tk.Menu(root)
+file_menu = tk.Menu(menubar, tearoff=0)
+file_menu.add_command(label="Згорнути в трей", command=lambda: minimize_to_tray())
+file_menu.add_separator()
+file_menu.add_command(label="Вихід", command=lambda: exit_app(confirm=False))
+menubar.add_cascade(label="Файл", menu=file_menu)
+settings_menu = tk.Menu(menubar, tearoff=0)
 settings_menu.add_command(label="Резервне копіювання бази…", command=backup_database)
 settings_menu.add_command(label="Імпорт бази…", command=import_database)
 settings_menu.add_separator()
@@ -590,10 +704,81 @@ main_pane.add(list_frame, stretch="always")
 log_frame = tk.LabelFrame(main_pane, text="Лог", bg="#1e1e1e", fg="#00bcd4"); log_text = scrolledtext.ScrolledText(log_frame, state='disabled', wrap='word', bg="#252526", fg="#f1f1f1"); log_text.pack(fill='both', expand=True); main_pane.add(log_frame, stretch="always")
 
 bottom_frame = tk.Frame(root, bg="#1e1e1e"); bottom_frame.pack(fill='x', padx=10, pady=6)
+tk.Button(bottom_frame, text="📥 У трей", command=minimize_to_tray, width=16, bg="#455a64", fg="white").pack(side='left', padx=5)
 tk.Button(bottom_frame, text="🧽 Очистити лог", command=clear_log, width=16, bg="#ff9800", fg="white").pack(side='right', padx=5)
 tk.Button(bottom_frame, text="🧾 Зберегти лог…", command=save_log_to_file, width=16, bg="#8bc34a", fg="black").pack(side='right', padx=5)
 
 status_var = tk.StringVar(value="Готово."); status_bar = tk.Label(root, textvariable=status_var, relief='sunken', anchor='w', bg="#333", fg="#ccc"); status_bar.pack(side='bottom', fill='x')
 
+
+def show_main_window():
+    root.deiconify()
+    try:
+        root.after(0, root.focus_force)
+    except Exception:
+        pass
+    if tray_controller and tray_controller.is_available():
+        tray_controller.hide()
+    status_var.set("Головне вікно активне")
+
+
+def minimize_to_tray():
+    global tray_controller
+    if tray_controller and tray_controller.is_available():
+        root.withdraw()
+        tray_controller.show()
+        status_var.set("NetshLite працює у треї")
+    else:
+        root.iconify()
+        status_var.set("Згорнуто у вікно")
+
+
+def exit_app(confirm: bool = True):
+    global connection_monitor, tray_controller
+    if confirm and not messagebox.askokcancel("Вихід", "Завершити NetshLite?"):
+        return
+    if connection_monitor:
+        try:
+            connection_monitor.stop()
+        except Exception:
+            pass
+        connection_monitor = None
+    if tray_controller:
+        try:
+            tray_controller.stop()
+        except Exception:
+            pass
+    root.destroy()
+
+
+def on_close():
+    if tray_controller and tray_controller.is_available():
+        minimize_to_tray()
+    else:
+        exit_app(confirm=False)
+
+
+def on_monitor_event(event, mon):
+    root.after(0, lambda ev=event, mm=mon: handle_outgoing_event(ev, mm))
+
+
+def on_monitor_error(msg: str):
+    root.after(0, lambda: report_monitor_error(msg))
+
+
+initial_known = [rec.get("path") for rec in db.values() if rec.get("path")] + [rec.get("path") for rec in allow_db.values() if rec.get("path")]
+connection_monitor = OutboundConnectionMonitor(initial_known, on_monitor_event, on_monitor_error)
+connection_monitor.start()
+
+tray_controller = TrayController(
+    tooltip="NetshLite Firewall Manager",
+    on_show=lambda: root.after(0, show_main_window),
+    on_exit=lambda: root.after(0, exit_app, False),
+)
+if tray_controller.start():
+    tray_controller.hide()
+root.protocol("WM_DELETE_WINDOW", on_close)
+
 reload_blocked_list()
+show_main_window()
 root.mainloop()
