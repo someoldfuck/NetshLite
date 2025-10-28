@@ -6,7 +6,6 @@ from datetime import datetime
 from .utils import sha1, run_cmd_line
 from .pshell import run_powershell
 from .db import save_db
-from .allowdb import add_allow_record, delete_allow_record
 
 # ---------- Правила Firewall ----------
 def add_rule(program_path: str):
@@ -24,16 +23,6 @@ def add_rule(program_path: str):
     )
     return r1, r2
 
-def add_allow_rule(program_path: str):
-    prog = program_path.replace("/", "\\")
-    h = sha1(program_path)
-    name = f"Allow_{h}_out"
-    res = run_cmd_line(
-        f'netsh advfirewall firewall add rule name="{name}" '
-        f'program="{prog}" action=allow dir=out enable=yes profile=any'
-    )
-    return res
-
 def delete_rule_by_path(program_path: str):
     h = sha1(program_path)
     in_name  = f"Block_{h}"
@@ -41,12 +30,6 @@ def delete_rule_by_path(program_path: str):
     r1 = run_cmd_line(f'netsh advfirewall firewall delete rule name="{in_name}"')
     r2 = run_cmd_line(f'netsh advfirewall firewall delete rule name="{out_name}"')
     return r1, r2
-
-def delete_allow_rule_by_path(program_path: str):
-    h = sha1(program_path)
-    name = f"Allow_{h}_out"
-    res = run_cmd_line(f'netsh advfirewall firewall delete rule name="{name}"')
-    return res
 
 def update_rule(program_path: str):
     """
@@ -74,20 +57,6 @@ def unblock_program(db: dict, path: str):
         del db[h]
         save_db(db)
     return r1, r2
-
-def allow_program(allow_db: dict, path: str, note: str = ""):
-    if not os.path.isfile(path):
-        raise FileNotFoundError("Файл не знайдено")
-    res = add_allow_rule(path)
-    h = sha1(path)
-    add_allow_record(allow_db, h, path, note)
-    return res
-
-def revoke_allow_program(allow_db: dict, path: str):
-    res = delete_allow_rule_by_path(path)
-    h = sha1(path)
-    delete_allow_record(allow_db, h)
-    return res
 
 # ---------- Відновлення зі справжніх правил ----------
 _PATH_RE = re.compile(r'(?:"?([A-Za-z]:\\[^"\r\n]*?\.exe)"?)|(?:"?(\\\\[^"\r\n]*?\.exe)"?)')
